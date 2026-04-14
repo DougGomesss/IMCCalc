@@ -1,289 +1,567 @@
 #include <LiquidCrystal.h>
 #include <Keypad.h>
 #include "HX711.h"
-#include "DHT.h" 
+#include "DHT.h"
 
-// ==========================================
-// 1. CONFIGURAÇÕES DE HARDWARE
-// ==========================================
-
-LiquidCrystal lcd(2, 15, 4, 5, 18, 19);
+LiquidCrystal _lcd(2, 15, 4, 5, 18, 19);
 
 const int LOADCELL_DOUT_PIN = 32;
 const int LOADCELL_SCK_PIN = 12;
-
-HX711 scale;
-// SEU FATOR CALIBRADO
-float calibration_factor = 28955.0; 
+HX711 _scale;
+float _calibrationFactor = 28955.0;
 
 const byte LINHAS = 4;
 const byte COLUNAS = 4;
-char teclas[LINHAS][COLUNAS] = {
-  {'E', '7', '4', '1'},
-  {'0', '8', '5', '2'},
-  {'R', '9', '6', '3'}, 
-  {'L', 'D', 'P', ' '}  
+char _teclas[LINHAS][COLUNAS] = {
+    {'E', '7', '4', '1'},
+    {'0', '8', '5', '2'},
+    {'R', '9', '6', '3'},
+    {'L', 'D', 'P', ' '}
 };
-byte pinosLinhas[LINHAS] = {23, 22, 21, 13};
-byte pinosColunas[COLUNAS] = {25, 26, 27, 14};
-Keypad teclado = Keypad(makeKeymap(teclas), pinosLinhas, pinosColunas, LINHAS, COLUNAS);
+
+byte _pinosLinhas[LINHAS] = {23, 22, 21, 13};
+byte _pinosColunas[COLUNAS] = {25, 26, 27, 14};
+Keypad _teclado = Keypad(makeKeymap(_teclas), _pinosLinhas, _pinosColunas, LINHAS, COLUNAS);
 
 #define DHTPIN 33
 #define DHTTYPE DHT22
-DHT dht(DHTPIN, DHTTYPE);
+DHT _dht(DHTPIN, DHTTYPE);
 
-// ==========================================
-// 2. VARIÁVEIS DO SISTEMA
-// ==========================================
-bool modoAltura = true; 
-String entradaAltura = "";
-float alturaUsuario = 0;
-float pesoAtual = 0;
-float pesoSuavizado = 0;
+String _entradaTexto = "";
+int _cursorPos = 0;
+float _alturaUsuario = 0.0;
+float _pesoUsuario = 0.0;
+float _ultimoPesoLido = 0.0;
+float _pesoAtual = 0.0;
 
-// Variáveis de Estabilidade
-unsigned long timerEstabilidade = 0;
-float ultimoPesoLido = 0;
-bool contandoTempo = false;
-const int TEMPO_PARA_TRAVAR = 3000; 
+enum Estado { AGUARDANDO_ALTURA, AGUARDANDO_PESO, STANDBY };
+Estado _estadoAtual = AGUARDANDO_ALTURA;
 
-// Variáveis de Inatividade (Screensaver)
-unsigned long lastActivityTime = 0;
-const long TEMPO_DESCANSO = 10000; // 10 segundos para mostrar temperatura
-bool emDescanso = false;
+bool _contandoPesagem = false;
+unsigned long _lastActivity = 0;
+unsigned long _tempoInicioPesagem = 0;
+unsigned long _timerStandby = 0;
+unsigned long _timerPesoDisplay = 0;
 
-// ==========================================
-// 3. SETUP
-// ==========================================
-void setup() {
-  Serial.begin(9600);
-  lcd.begin(16, 2);
-  dht.begin();
+const long TEMPO_STANDBY = 10000;
+const long TEMPO_PESAGEM = 5000;
 
-  lcd.clear();
-  lcd.print("Iniciando...");
-  
-  scale.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
-  scale.set_scale(calibration_factor);
-  scale.power_up(); 
-  
-  lcd.setCursor(0, 1);
-  lcd.print("Zerando Tara...");
-  delay(1000);
-  scale.tare(); 
-  
-  resetarParaAltura();
-}
+void AtualizarDisplayAltura();
+void AnimacaoErro();
+void AnimacaoCalculando();
+void FinalizarCalculo();
+void ProcessarPesagem(float peso);
+void ValidarAltura();
+void ProcessarAltura(char tecla);
+void ExecutarStandby();
+void AcordarSistema();
+void EntrarStandby();
+void ReiniciarSistema();
+void AnimacaoInicial();
+void PrintSerialBanner();
 
-// ==========================================
-// 4. LOOP PRINCIPAL
-// ==========================================
-void loop() {
-  // Lê a balança sempre (para saber se alguém subiu e acordar o sistema)
-  bool balancaAtiva = verificarAtividadeBalanca();
-  char tecla = teclado.getKey();
-
-  // --- GERENCIAMENTO DE INATIVIDADE (Screensaver) ---
-  if (tecla || balancaAtiva) {
-    lastActivityTime = millis(); // Reseta o timer se houver ação
-    if (emDescanso) {
-      emDescanso = false;
-      // Se acordou, volta a mostrar o que estava antes
-      if (modoAltura) atualizarDisplayAltura();
-    }
-  }
-
-  // Verifica se passou 10s sem fazer nada E a balança está vazia
-  if (!emDescanso && (millis() - lastActivityTime > TEMPO_DESCANSO) && !balancaAtiva) {
-    mostrarTelaDescanso();
-    return; // Pula o resto do loop enquanto estiver descansando
-  }
-
-  if (emDescanso) {
-    // Se está em descanso, só fica atualizando a temperatura a cada 2s
-    static unsigned long timerTemp = 0;
-    if (millis() - timerTemp > 2000) {
-      mostrarTelaDescanso();
-      timerTemp = millis();
-    }
-    return;
-  }
-
-  // --- LÓGICA NORMAL DO SISTEMA ---
-  
-  if (modoAltura) {
-    if (tecla) {
-      if (isDigit(tecla) || tecla == 'P') {
-        char c = (tecla == 'P') ? '.' : tecla;
-        if (entradaAltura.length() < 5) entradaAltura += c;
-        atualizarDisplayAltura();
-      }
-      else if (tecla == 'E') { 
-        entradaAltura = "";
-        atualizarDisplayAltura();
-      }
-      else if (tecla == 'R') { 
-        confirmarAltura();
-      }
-    }
-  }
-  else {
-    // Modo Pesagem
-    lerPesoEProcessar();
+void setup()
+{
+    Serial.begin(9600);
+    _lcd.begin(16, 2);
+    _dht.begin();
     
-    if (tecla == 'E') {
-      resetarParaAltura();
-    }
-  }
-  
-  delay(50); 
-}
-
-// ==========================================
-// 5. FUNÇÕES AUXILIARES
-// ==========================================
-
-// Lê a balança e retorna TRUE se tiver peso (alguém em cima)
-bool verificarAtividadeBalanca() {
-  if (scale.is_ready()) {
-    float leitura = scale.get_units(1);
+    _scale.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
+    _scale.set_scale(_calibrationFactor);
+    _scale.power_up();
+    _scale.tare();
     
-    // Filtro rápido apenas para checar atividade
-    pesoSuavizado = (pesoSuavizado * 0.80) + (leitura * 0.20);
-    if (abs(pesoSuavizado) < 0.2) pesoSuavizado = 0.0;
-    pesoAtual = pesoSuavizado;
-    
-    // Se tiver mais de 0.5kg, considera atividade (acorda o sistema)
-    return (pesoAtual > 0.5);
-  }
-  return false;
+    _teclado.setDebounceTime(50);
+    _teclado.setHoldTime(400);
+
+    PrintSerialBanner();
+    AnimacaoInicial();
+    ReiniciarSistema();
 }
 
-void mostrarTelaDescanso() {
-  if (!emDescanso) lcd.clear();
-  emDescanso = true;
-  
-  float t = dht.readTemperature();
-  
-  lcd.setCursor(0, 0);
-  lcd.print("   EM ESPERA    ");
-  lcd.setCursor(0, 1);
-  lcd.print("Temp: "); 
-  if (!isnan(t)) {
-    lcd.print(t, 1); lcd.print(" C     ");
-  } else {
-    lcd.print("-- C     ");
-  }
-}
+void loop()
+{
+    char tecla = _teclado.getKey();
+    String entradaSerial = "";
 
-void atualizarDisplayAltura() {
-  lcd.clear();
-  lcd.print("Altura (m):");
-  lcd.setCursor(0, 1);
-  lcd.print(entradaAltura);
-  lcd.blink(); 
-}
+    if (_scale.is_ready())
+    {
+        _pesoAtual = _scale.get_units(1);
 
-void confirmarAltura() {
-  if (entradaAltura.length() > 0) {
-    alturaUsuario = entradaAltura.toFloat();
-    if (alturaUsuario > 0.5 && alturaUsuario < 2.5) {
-      modoAltura = false;
-      lcd.noBlink();
-      lcd.clear();
-      lcd.print("Ok! Suba agora.");
-      delay(1500);
-      lcd.clear();
-      lastActivityTime = millis(); // Reseta timer
-    } else {
-      lcd.clear(); lcd.print("Altura Invalida"); delay(1000); atualizarDisplayAltura();
-    }
-  }
-}
-
-void resetarParaAltura() {
-  modoAltura = true;
-  entradaAltura = "";
-  pesoSuavizado = 0;
-  contandoTempo = false;
-  emDescanso = false;
-  lastActivityTime = millis();
-  atualizarDisplayAltura();
-}
-
-void lerPesoEProcessar() {
-  // ATENÇÃO: A leitura do peso já foi feita na função 'verificarAtividadeBalanca'
-  // no início do loop. Usamos a variável global 'pesoAtual' que já está atualizada.
-
-  // --- ATUALIZA O LCD ---
-  static unsigned long timerLCD = 0;
-  if (millis() - timerLCD > 200) {
-      lcd.setCursor(0, 0);
-      lcd.print("Lendo Peso...");
-      
-      lcd.setCursor(0, 1);
-      if (pesoAtual > 0) {
-          lcd.print(pesoAtual, 1); 
-          lcd.print(" kg      "); 
-      } else {
-          lcd.print("0.0 kg      ");
-      }
-      
-      if (contandoTempo) {
-        int seg = 3 - ((millis() - timerEstabilidade) / 1000);
-        lcd.setCursor(13, 1);
-        lcd.print(seg); lcd.print("s ");
-      } else {
-        lcd.setCursor(13, 1);
-        lcd.print("   ");
-      }
-      timerLCD = millis();
-  }
-
-  // --- LÓGICA DE TRAVAMENTO ---
-  if (pesoAtual > 2.0) { 
-    if (abs(pesoAtual - ultimoPesoLido) < 0.1) { 
-      if (!contandoTempo) {
-        contandoTempo = true;
-        timerEstabilidade = millis(); 
-      } else {
-        if (millis() - timerEstabilidade >= TEMPO_PARA_TRAVAR) {
-          finalizarProcesso(); 
+        if (_pesoAtual < 0)
+        {
+            _pesoAtual = 0;
         }
-      }
-    } else {
-      contandoTempo = false; 
     }
-    ultimoPesoLido = pesoAtual;
-  } else {
-    contandoTempo = false; 
-  }
+
+    if (Serial.available() > 0)
+    {
+        entradaSerial = Serial.readStringUntil('\n');
+        entradaSerial.trim();
+    }
+
+    bool pesoMudou = abs(_pesoAtual - _ultimoPesoLido) > 0.5 || _pesoAtual > 2.0;
+
+    if (tecla || entradaSerial.length() > 0 || pesoMudou)
+    {
+        _lastActivity = millis();
+        _ultimoPesoLido = _pesoAtual;
+
+        if (_estadoAtual == STANDBY)
+        {
+            AcordarSistema();
+
+            return;
+        }
+    }
+
+    if (_estadoAtual != STANDBY && (millis() - _lastActivity > TEMPO_STANDBY))
+    {
+        EntrarStandby();
+
+        return;
+    }
+
+    switch (_estadoAtual)
+    {
+        case STANDBY:
+            ExecutarStandby();
+            break;
+
+        case AGUARDANDO_ALTURA:
+            if (entradaSerial.length() > 0)
+            {
+                Serial.print("[SERIAL] Valor recebido: ");
+                Serial.println(entradaSerial);
+                _entradaTexto = entradaSerial;
+                _cursorPos = _entradaTexto.length();
+
+                AtualizarDisplayAltura();
+                ValidarAltura();
+            }
+            else
+            {
+                ProcessarAltura(tecla);
+            }
+            break;
+
+        case AGUARDANDO_PESO:
+            ProcessarPesagem(_pesoAtual);
+            break;
+    }
+
+    delay(50);
 }
 
-void finalizarProcesso() {
-  // 1. TRAVAMENTO
-  lcd.clear();
-  lcd.print(">> TRAVADO <<");
-  lcd.setCursor(0, 1);
-  lcd.print(pesoAtual, 1); lcd.print(" kg");
-  delay(2000); // Mostra o peso travado por 2s
-  
-  // 2. CÁLCULO
-  float imc = pesoAtual / (alturaUsuario * alturaUsuario);
-  
-  lcd.clear();
-  lcd.print("IMC: "); lcd.print(imc, 1);
-  lcd.setCursor(0, 1);
-  
-  if (imc < 18.5) lcd.print("Magreza");
-  else if (imc < 25) lcd.print("Normal");
-  else if (imc < 30) lcd.print("Sobrepeso");
-  else if (imc < 35) lcd.print("Obesidade I");
-  else if (imc < 40) lcd.print("Obesidade II");
-  else lcd.print("Obesidade III");
-  
-  // 3. ESPERA 5 SEGUNDOS E REINICIA
-  delay(5000); 
-  
-  resetarParaAltura(); 
+void ReiniciarSistema()
+{
+    _estadoAtual = AGUARDANDO_ALTURA;
+    _contandoPesagem = false;
+    _entradaTexto = "";
+    _cursorPos = 0;
+    _lastActivity = millis();
+
+    _lcd.clear();
+    _lcd.print("Altura (m):");
+
+    Serial.println();
+    Serial.println("============================");
+    Serial.println("  [AGUARDANDO] Altura (m)   ");
+    Serial.println("  Teclado: digite + ENTER   ");
+    Serial.println("  Serial:  envie o valor    ");
+    Serial.println("  Ex: 1.75                  ");
+    Serial.println("============================");
+}
+
+void EntrarStandby()
+{
+    _estadoAtual = STANDBY;
+    _contandoPesagem = false;
+    _timerStandby = 0;
+
+    Serial.println("\n--- MODO STANDBY ATIVO ---");
+}
+
+void AcordarSistema()
+{
+    _lastActivity = millis();
+
+    if (_estadoAtual == STANDBY)
+    {
+        _estadoAtual = (_alturaUsuario == 0.0) ? AGUARDANDO_ALTURA : AGUARDANDO_PESO;
+    }
+
+    Serial.println("--- SISTEMA RETOMADO ---");
+    _lcd.clear();
+
+    if (_estadoAtual == AGUARDANDO_ALTURA)
+    {
+        _lcd.print("Altura (m):");
+        _lcd.setCursor(0, 1);
+        _lcd.print(_entradaTexto);
+
+        Serial.println("Aguardando Altura (m)...");
+    }
+    else
+    {
+        _lcd.print("Suba na balanca");
+        _lcd.setCursor(0, 1);
+        _lcd.print("e aguarde...");
+
+        Serial.println("Aguardando Peso na Balanca...");
+    }
+}
+
+void ExecutarStandby()
+{
+    if (millis() - _timerStandby > 3000)
+    {
+        _timerStandby = millis();
+
+        float t = _dht.readTemperature();
+        float h = _dht.readHumidity();
+
+        _lcd.clear();
+
+        if (!isnan(t) && !isnan(h))
+        {
+            _lcd.setCursor(0, 0);
+            _lcd.print("Temp: ");
+            _lcd.print(t, 1);
+            _lcd.print((char)223);
+            _lcd.print("C");
+            
+            _lcd.setCursor(0, 1);
+            _lcd.print("Umid: ");
+            _lcd.print(h, 1);
+            _lcd.print("%");
+
+            Serial.print("[STANDBY] Temp: ");
+            Serial.print(t, 1);
+            Serial.print(" C | Umid: ");
+            Serial.print(h, 1);
+            Serial.println(" %");
+        }
+        else
+        {
+            _lcd.print("Sensor DHT");
+            _lcd.setCursor(0, 1);
+            _lcd.print("Falha de leitura");
+
+            Serial.println("[STANDBY] Falha no sensor DHT.");
+        }
+    }
+}
+
+void ProcessarAltura(char tecla)
+{
+    if (!tecla)
+    {
+        return;
+    }
+
+    Serial.print("[TECLADO] Tecla: '");
+    Serial.print(tecla);
+    Serial.println("'");
+
+    if (isDigit(tecla) || tecla == 'P')
+    {
+        char c = (tecla == 'P') ? '.' : tecla;
+
+        if (_cursorPos < (int)_entradaTexto.length())
+        {
+            _entradaTexto[_cursorPos] = c;
+        }
+        else
+        {
+            _entradaTexto += c;
+        }
+
+        _cursorPos++;
+
+        Serial.print("[TECLADO] Entrada atual: ");
+        Serial.println(_entradaTexto);
+
+        AtualizarDisplayAltura();
+    }
+    else if (tecla == 'E')
+    {
+        if (_cursorPos > 0)
+        {
+            _entradaTexto.remove(_cursorPos - 1, 1);
+            _cursorPos--;
+
+            Serial.print("[TECLADO] Apagou. Entrada: ");
+            Serial.println(_entradaTexto);
+
+            AtualizarDisplayAltura();
+        }
+    }
+    else if (tecla == 'D' && _cursorPos < (int)_entradaTexto.length())
+    {
+        _cursorPos++;
+        _lcd.setCursor(_cursorPos, 1);
+    }
+    else if (tecla == 'L' && _cursorPos > 0)
+    {
+        _cursorPos--;
+        _lcd.setCursor(_cursorPos, 1);
+    }
+    else if (tecla == 'R')
+    {
+        Serial.print("[TECLADO] ENTER. Valor: ");
+        Serial.println(_entradaTexto);
+
+        ValidarAltura();
+    }
+}
+
+void ValidarAltura()
+{
+    float valor = _entradaTexto.toFloat();
+
+    if (valor >= 0.50 && valor <= 2.50)
+    {
+        _alturaUsuario = valor;
+        _estadoAtual = AGUARDANDO_PESO;
+        _entradaTexto = "";
+        _cursorPos = 0;
+
+        _lcd.clear();
+        _lcd.print("Altura: ");
+        _lcd.print(_alturaUsuario, 2);
+        _lcd.print("m");
+
+        delay(1200);
+
+        _lcd.clear();
+        _lcd.print("Suba na balanca");
+        _lcd.setCursor(0, 1);
+        _lcd.print("e aguarde...");
+
+        Serial.println();
+        Serial.println("-----------------------------");
+        Serial.print(" Altura registrada: ");
+        Serial.print(_alturaUsuario, 2);
+        Serial.println(" m  ");
+        Serial.println("-----------------------------");
+        Serial.println(" Suba na balanca e           ");
+        Serial.println(" fique imóvel por 5 segundos ");
+        Serial.println("-----------------------------");
+    }
+    else
+    {
+        AnimacaoErro();
+
+        _lcd.clear();
+        _lcd.print("Altura (m):");
+        _entradaTexto = "";
+        _cursorPos = 0;
+
+        Serial.println();
+        Serial.println("==============================");
+        Serial.println("    ERRO: ALTURA INVALIDA     ");
+        Serial.println("  Faixa aceita: 0.50 - 2.50   ");
+        Serial.print("  Valor enviado: ");
+        Serial.print(_entradaTexto);
+        Serial.println("          ");
+        Serial.println("==============================");
+    }
+}
+
+void ProcessarPesagem(float pesoAtual)
+{
+    if (pesoAtual > 2.0)
+    {
+        if (!_contandoPesagem)
+        {
+            _contandoPesagem = true;
+            _tempoInicioPesagem = millis();
+            _timerPesoDisplay = 0;
+
+            Serial.println("[BALANCA] Peso detectado! Estabilizando...");
+        }
+
+        if (millis() - _timerPesoDisplay > 1000)
+        {
+            _timerPesoDisplay = millis();
+            int restante = 5 - (int)((millis() - _tempoInicioPesagem) / 1000);
+
+            _lcd.clear();
+            _lcd.print("Peso: ");
+            _lcd.print(pesoAtual, 1);
+            _lcd.print(" kg");
+            
+            _lcd.setCursor(0, 1);
+            _lcd.print("Aguarde: ");
+            _lcd.print(restante);
+            _lcd.print("s...");
+
+            Serial.print("[BALANCA] Lendo: ");
+            Serial.print(pesoAtual, 1);
+            Serial.print(" kg | Confirmando em: ");
+            Serial.print(restante);
+            Serial.println("s");
+        }
+
+        if (millis() - _tempoInicioPesagem >= TEMPO_PESAGEM)
+        {
+            _pesoUsuario = pesoAtual;
+
+            AnimacaoCalculando();
+            FinalizarCalculo();
+        }
+    }
+    else
+    {
+        if (_contandoPesagem)
+        {
+            _contandoPesagem = false;
+
+            _lcd.clear();
+            _lcd.print("Suba na balanca");
+            _lcd.setCursor(0, 1);
+            _lcd.print("e aguarde...");
+
+            Serial.println("[BALANCA] Processo interrompido. Mantenha-se na balanca!");
+        }
+    }
+}
+
+void FinalizarCalculo()
+{
+    float imc = _pesoUsuario / (_alturaUsuario * _alturaUsuario);
+    String classificacao;
+    String classificacaoLcd;
+
+    if (imc < 18.5)
+    {
+        classificacao = "Abaixo do peso";
+        classificacaoLcd = "Abaixo do peso";
+    }
+    else if (imc < 25.0)
+    {
+        classificacao = "Peso Normal";
+        classificacaoLcd = "Normal";
+    }
+    else if (imc < 30.0)
+    {
+        classificacao = "Sobrepeso";
+        classificacaoLcd = "Sobrepeso";
+    }
+    else if (imc < 35.0)
+    {
+        classificacao = "Obesidade I";
+        classificacaoLcd = "Obesid. I";
+    }
+    else if (imc < 40.0)
+    {
+        classificacao = "Obesidade II";
+        classificacaoLcd = "Obesid. II";
+    }
+    else
+    {
+        classificacao = "Obesidade III";
+        classificacaoLcd = "Obesid. III";
+    }
+
+    _lcd.clear();
+    _lcd.print("IMC: ");
+    _lcd.print(imc, 1);
+    
+    _lcd.setCursor(0, 1);
+    _lcd.print(classificacaoLcd);
+
+    Serial.println();
+    Serial.println("==============================");
+    Serial.println("      RELATORIO BIOMETRICO    ");
+    Serial.println("==============================");
+    Serial.print("  Altura : ");
+    Serial.print(_alturaUsuario, 2);
+    Serial.println(" m              ");
+    Serial.print("  Peso   : ");
+    Serial.print(_pesoUsuario, 1);
+    Serial.println(" kg             ");
+    Serial.print("  IMC    : ");
+    Serial.print(imc, 1);
+    Serial.println("                ");
+    Serial.println("------------------------------");
+    Serial.print("  Status : ");
+    Serial.print(classificacao);
+    Serial.println("          ");
+    Serial.println("==============================");
+
+    delay(5000);
+
+    _scale.tare();
+    _alturaUsuario = 0.0;
+
+    ReiniciarSistema();
+}
+
+void AtualizarDisplayAltura()
+{
+    _lcd.setCursor(0, 1);
+    _lcd.print("                ");
+    _lcd.setCursor(0, 1);
+    _lcd.print(_entradaTexto);
+    _lcd.setCursor(_cursorPos, 1);
+}
+
+void AnimacaoInicial()
+{
+    _lcd.clear();
+    _lcd.print("Iniciando");
+
+    for (int i = 0; i < 3; i++)
+    {
+        _lcd.print(".");
+        delay(300);
+    }
+
+    _lcd.clear();
+    _lcd.print("Pronto!");
+
+    delay(600);
+}
+
+void AnimacaoCalculando()
+{
+    _lcd.clear();
+    _lcd.print("Calculando");
+
+    for (int i = 0; i < 6; i++)
+    {
+        _lcd.print(".");
+        delay(250);
+    }
+}
+
+void AnimacaoErro()
+{
+    _lcd.clear();
+    _lcd.print("Entrada invalida");
+
+    for (int i = 0; i < 3; i++)
+    {
+        _lcd.noDisplay();
+        delay(200);
+        _lcd.display();
+        delay(200);
+    }
+}
+
+void PrintSerialBanner()
+{
+    Serial.println();
+    Serial.println("==============================");
+    Serial.println("  CALCULADORA IMC + BALANCA   ");
+    Serial.println("==============================");
+    Serial.println("  ALTURA: teclado ou serial   ");
+    Serial.println("  PESO:   balanca HX711       ");
+    Serial.println("------------------------------");
+    Serial.println("  Comandos Serial:            ");
+    Serial.println("  Altura: envie ex. 1.75      ");
+    Serial.println("  C = limpar entrada atual    ");
+    Serial.println("==============================");
 }
